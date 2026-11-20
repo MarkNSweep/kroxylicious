@@ -24,6 +24,7 @@ import org.slf4j.LoggerFactory;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.annotation.JsonPropertyOrder;
 
+import io.kroxylicious.mcp.config.McpConfiguration;
 import io.kroxylicious.proxy.bootstrap.RouterChainFactory;
 import io.kroxylicious.proxy.config.admin.ManagementConfiguration;
 import io.kroxylicious.proxy.internal.routing.DirectRouting;
@@ -40,6 +41,7 @@ import edu.umd.cs.findbugs.annotations.Nullable;
  * <br>
  *
  * @param management management configuration
+ * @param mcp MCP server configuration
  * @param clusterDefinitions Named target cluster definitions, referenced by virtual clusters and routes.
  * @param filterDefinitions A list of named filter definitions (names must be unique)
  * @param defaultFilters The names of the {@link #filterDefinitions()} to be use when a {@link VirtualCluster} doesn't specify its own {@link VirtualCluster#filters()}.
@@ -50,11 +52,12 @@ import edu.umd.cs.findbugs.annotations.Nullable;
  * @param development Development options
  * @param network Controls aspects of network configuration for the proxy.
  */
-@JsonPropertyOrder({ "management", "clusterDefinitions", "filterDefinitions", "defaultFilters", "routerDefinitions", "virtualClusters", "micrometer", "useIoUring",
+@JsonPropertyOrder({ "management", "mcp", "clusterDefinitions", "filterDefinitions", "defaultFilters", "routerDefinitions", "virtualClusters", "micrometer", "useIoUring",
         "development", "network" })
 @SuppressWarnings("removal") // targetCluster() scheduled for removal
 public record Configuration(
                             @Nullable ManagementConfiguration management,
+                            @Nullable McpConfiguration mcp,
                             @Nullable List<ClusterDefinition> clusterDefinitions,
                             @Nullable List<NamedFilterDefinition> filterDefinitions,
                             @Nullable List<String> defaultFilters,
@@ -66,6 +69,33 @@ public record Configuration(
                             @Nullable NetworkDefinition network) {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(Configuration.class);
+
+    /**
+     * Backward-compatible convenience constructor omitting mcp.
+     *
+     * @param management management configuration
+     * @param clusterDefinitions Named target cluster definitions, referenced by virtual clusters and routes.
+     * @param filterDefinitions A list of named filter definitions (names must be unique)
+     * @param defaultFilters The names of the {@link #filterDefinitions()} to be used when a {@link VirtualCluster} doesn't specify its own {@link VirtualCluster#filters()}.
+     * @param routerDefinitions Named router definitions.
+     * @param virtualClusters The virtual clusters
+     * @param micrometer The micrometer config
+     * @param useIoUring true to use iouring
+     * @param development Development options
+     * @param network Controls aspects of network configuration for the proxy.
+     */
+    public Configuration(@Nullable ManagementConfiguration management,
+                         @Nullable List<ClusterDefinition> clusterDefinitions,
+                         @Nullable List<NamedFilterDefinition> filterDefinitions,
+                         @Nullable List<String> defaultFilters,
+                         @Nullable List<RouterDefinition> routerDefinitions,
+                         List<VirtualCluster> virtualClusters,
+                         @Nullable List<MicrometerDefinition> micrometer,
+                         boolean useIoUring,
+                         Optional<Map<String, Object>> development,
+                         @Nullable NetworkDefinition network) {
+        this(management, null, clusterDefinitions, filterDefinitions, defaultFilters, routerDefinitions, virtualClusters, micrometer, useIoUring, development, network);
+    }
 
     /**
      * Creates an instance of configuration.

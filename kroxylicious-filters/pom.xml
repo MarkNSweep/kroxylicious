@@ -67,6 +67,7 @@
                                         <include>io.kroxylicious:kroxylicious-integration-test-support</include>
                                         <include>io.kroxylicious:kroxylicious-kafka-message-tools</include>
                                         <include>io.kroxylicious:kroxylicious-runtime:*:*:test</include>
+                                        <include>io.kroxylicious:kroxylicious-mcp-server:*:*:test</include>
                                     </includes>
                                 </bannedDependencies>
                             </rules>

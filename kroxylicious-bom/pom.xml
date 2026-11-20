@@ -119,6 +119,12 @@
                 <version>${project.version}</version>
             </dependency>
 
+            <dependency>
+                <groupId>io.kroxylicious</groupId>
+                <artifactId>kroxylicious-mcp-server</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+
             <!-- Optional Production dependencies -->
             <dependency>
                 <groupId>io.kroxylicious</groupId>

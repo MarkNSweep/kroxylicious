@@ -44,6 +44,7 @@
         <module>../kroxylicious-wire-fidelity-tests</module>
         <module>../kroxylicious-integration-test-support</module>
         <module>../kroxylicious-runtime</module>
+        <module>../kroxylicious-mcp-server</module>
         <module>../kroxylicious-app</module>
         <module>kroxylicious-migrations</module>
         <module>../tools/kafka-vendoring</module>

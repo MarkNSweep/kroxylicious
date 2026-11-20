@@ -7,6 +7,7 @@ package io.kroxylicious.proxy;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -49,6 +50,9 @@ import io.netty.channel.uring.IoUringServerSocketChannel;
 import io.netty.util.concurrent.Future;
 
 import io.kroxylicious.kafka.common.protocol.ApiKeys;
+import io.kroxylicious.mcp.McpInspectionContext;
+import io.kroxylicious.mcp.McpServer;
+import io.kroxylicious.mcp.config.McpConfiguration;
 import io.kroxylicious.proxy.config.Configuration;
 import io.kroxylicious.proxy.config.IllegalConfigurationException;
 import io.kroxylicious.proxy.config.MicrometerDefinition;
@@ -64,6 +68,7 @@ import io.kroxylicious.proxy.internal.VirtualClusterLifecycle;
 import io.kroxylicious.proxy.internal.VirtualClusterRegistry;
 import io.kroxylicious.proxy.internal.admin.ManagementInitializer;
 import io.kroxylicious.proxy.internal.config.Features;
+import io.kroxylicious.proxy.internal.filter.impl.ClientIdRecordingFilter;
 import io.kroxylicious.proxy.internal.net.DefaultNetworkBindingOperationProcessor;
 import io.kroxylicious.proxy.internal.net.EndpointRegistry;
 import io.kroxylicious.proxy.internal.net.NetworkBindingOperationProcessor;
@@ -204,6 +209,7 @@ public final class KafkaProxy implements AutoCloseable {
 
     private final Configuration config;
     private final @Nullable ManagementConfiguration managementConfiguration;
+    private final @Nullable McpConfiguration mcpConfiguration;
     private final List<MicrometerDefinition> micrometerConfig;
     private final AtomicReference<LifecycleState> state = new AtomicReference<>(LifecycleState.NEW);
     private final CompletableFuture<Void> shutdown = new CompletableFuture<>();
@@ -216,6 +222,7 @@ public final class KafkaProxy implements AutoCloseable {
     private @Nullable ConfigurationReloadOrchestrator reconfigureOrchestrator;
     private @Nullable EventGroupConfig managementEventGroup;
     private @Nullable EventGroupConfig proxyEventGroup;
+    private @Nullable McpServer mcpServer;
 
     /**
      * Creates a proxy for the given configuration. The configuration is validated against the
@@ -238,6 +245,7 @@ public final class KafkaProxy implements AutoCloseable {
         this.config = validate(requireNonNull(config), requireNonNull(features));
         this.virtualClusterRegistry = requireNonNull(virtualClusterRegistry);
         this.managementConfiguration = config.management();
+        this.mcpConfiguration = config.mcp();
         this.micrometerConfig = config.getMicrometer();
     }
 
@@ -333,7 +341,12 @@ public final class KafkaProxy implements AutoCloseable {
             var portConflictDefector = new PortConflictDetector();
             var managementHostPort = Optional.ofNullable(managementConfiguration)
                     .map(c -> new HostPort(c.getEffectiveBindAddress(), c.getEffectivePort()));
+            var mcpHostPort = Optional.ofNullable(mcpConfiguration)
+                    .map(c -> new HostPort(c.getEffectiveBindAddress(), c.getEffectivePort()));
             portConflictDefector.validate(virtualClusterModels, managementHostPort);
+            if (mcpHostPort.isPresent()) {
+                portConflictDefector.validate(virtualClusterModels, mcpHostPort);
+            }
 
             this.managementEventGroup = EventGroupConfig.build("management", config, NetworkDefinition::management, config.isUseIoUring());
             this.proxyEventGroup = EventGroupConfig.build("proxy", config, NetworkDefinition::proxy, config.isUseIoUring());
@@ -341,6 +354,7 @@ public final class KafkaProxy implements AutoCloseable {
             enableNettyMetrics(managementEventGroup, proxyEventGroup);
 
             var managementFuture = maybeStartManagementListener(managementEventGroup, meterRegistries);
+            var mcpFuture = maybeStartMcpListener(managementEventGroup);
 
             var overrideMap = getApiKeyMaxVersionOverride(config);
             ApiVersionsServiceImpl apiVersionsService = new ApiVersionsServiceImpl(overrideMap);
@@ -361,7 +375,7 @@ public final class KafkaProxy implements AutoCloseable {
             bindingOperationProcessor.start(plainServerBootstrap, tlsServerBootstrap);
 
             CompletableFuture.allOf(
-                    Stream.concat(Stream.of(managementFuture),
+                    Stream.concat(Stream.of(managementFuture, mcpFuture),
                             virtualClusterModels.stream()
                                     .flatMap(vc -> vc.gateways().values().stream())
                                     .map(vcl -> endpointRegistry.registerVirtualCluster(vcl)
@@ -526,6 +540,82 @@ public final class KafkaProxy implements AutoCloseable {
                 }).orElseGet(() -> CompletableFuture.completedFuture(null));
     }
 
+    private CompletableFuture<Void> maybeStartMcpListener(EventGroupConfig eventGroupConfig) {
+        return Optional.ofNullable(mcpConfiguration)
+                .map(mc -> {
+                    McpInspectionContext inspectionContext = buildMcpInspectionContext();
+                    this.mcpServer = new McpServer(mc, inspectionContext, eventGroupConfig.bossGroup(), eventGroupConfig.workerGroup(), eventGroupConfig.clazz());
+                    return mcpServer.startup();
+                }).orElseGet(() -> CompletableFuture.completedFuture(null));
+    }
+
+    private McpInspectionContext buildMcpInspectionContext() {
+        return new McpInspectionContext() {
+            @Override
+            public Map<String, Object> getProxyStatus() {
+                return Map.of(
+                        "state", state.get().name(),
+                        "jreVersion", JRE_FEATURE_VERSION,
+                        "availableProcessors", Runtime.getRuntime().availableProcessors(),
+                        "freeMemoryBytes", Runtime.getRuntime().freeMemory(),
+                        "totalMemoryBytes", Runtime.getRuntime().totalMemory(),
+                        "maxMemoryBytes", Runtime.getRuntime().maxMemory());
+            }
+
+            @Override
+            public Object getConfiguration() {
+                return config;
+            }
+
+            @Override
+            public List<Map<String, Object>> getVirtualClusters() {
+                return virtualClusterRegistry.virtualClusterModels().stream()
+                        .map(vcm -> {
+                            Map<String, Object> details = new HashMap<>();
+                            details.put("clusterName", vcm.getClusterName());
+                            details.put("gateways", vcm.gateways().keySet().stream().toList());
+                            details.put("routing", vcm.routing().getClass().getSimpleName());
+                            return details;
+                        })
+                        .toList();
+            }
+
+            @Override
+            public List<Map<String, Object>> getFilterDefinitions() {
+                return Optional.ofNullable(config.filterDefinitions()).orElse(List.of()).stream()
+                        .map(fd -> Map.<String, Object> of(
+                                "name", fd.name(),
+                                "type", fd.type()))
+                        .toList();
+            }
+
+            @Override
+            public List<Map<String, Object>> getConnectedClients() {
+                return ClientIdRecordingFilter.instance().connectedClients().stream()
+                        .map(r -> Map.<String, Object> of(
+                                "virtualCluster", r.virtualCluster(),
+                                "sessionId", r.sessionId(),
+                                "clientId", r.clientId(),
+                                "timestamp", r.timestamp().toString()))
+                        .toList();
+            }
+
+            @Override
+            public Map<String, Object> getMetricsSummary() {
+                var globalRegistry = io.micrometer.core.instrument.Metrics.globalRegistry;
+                var meterCount = globalRegistry.getMeters().size();
+                var meterNames = globalRegistry.getMeters().stream()
+                        .map(m -> m.getId().getName())
+                        .distinct()
+                        .sorted()
+                        .toList();
+                return Map.of(
+                        "meterCount", meterCount,
+                        "meterNames", meterNames);
+            }
+        };
+    }
+
     /**
      * Apply the given configuration to this running proxy, restarting only the virtual clusters
      * whose effective configuration differs from the current running state. Unaffected clusters
@@ -599,6 +689,17 @@ public final class KafkaProxy implements AutoCloseable {
             }, lifecycleState -> LOGGER.atWarn()
                     .addKeyValue("state", lifecycleState)
                     .log("Unexpected state during shutdown, expected STOPPING"));
+            if (mcpServer != null) {
+                try {
+                    mcpServer.shutdown().join();
+                }
+                catch (Exception e) {
+                    LOGGER.atWarn()
+                            .setCause(e)
+                            .log("Exception closing MCP server during shutdown");
+                }
+                mcpServer = null;
+            }
             managementEventGroup = null;
             proxyEventGroup = null;
             meterRegistries = null;

@@ -39,6 +39,7 @@ import io.kroxylicious.proxy.config.ProxyProtocolMode;
 import io.kroxylicious.proxy.internal.codec.KafkaMessageListener;
 import io.kroxylicious.proxy.internal.codec.KafkaRequestDecoder;
 import io.kroxylicious.proxy.internal.codec.KafkaResponseEncoder;
+import io.kroxylicious.proxy.internal.filter.impl.ClientIdRecordingFilter;
 import io.kroxylicious.proxy.internal.metrics.MetricEmittingKafkaMessageListener;
 import io.kroxylicious.proxy.internal.net.EndpointBinding;
 import io.kroxylicious.proxy.internal.net.EndpointBindingResolver;
@@ -226,7 +227,10 @@ public class KafkaProxyInitializer extends ChannelInitializer<Channel> {
             rejectConnection(ch, clusterName);
             return;
         }
-        ch.closeFuture().addListener(f -> virtualClusterRegistry.deregisterConnection(clusterName, clientConnectionStateMachine));
+        ch.closeFuture().addListener(f -> {
+            ClientIdRecordingFilter.instance().remove(clientConnectionStateMachine.sessionId());
+            virtualClusterRegistry.deregisterConnection(clusterName, clientConnectionStateMachine);
+        });
         addHandlers(ch, binding, subjectBuilder, clientConnectionStateMachine);
     }
 
