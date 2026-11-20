@@ -7,12 +7,15 @@ package io.kroxylicious.proxy;
 
 import java.time.Duration;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.TreeSet;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutionException;
@@ -53,6 +56,7 @@ import io.kroxylicious.kafka.common.protocol.ApiKeys;
 import io.kroxylicious.mcp.McpInspectionContext;
 import io.kroxylicious.mcp.McpServer;
 import io.kroxylicious.mcp.config.McpConfiguration;
+import io.kroxylicious.proxy.config.ConfigParser;
 import io.kroxylicious.proxy.config.Configuration;
 import io.kroxylicious.proxy.config.IllegalConfigurationException;
 import io.kroxylicious.proxy.config.MicrometerDefinition;
@@ -69,6 +73,7 @@ import io.kroxylicious.proxy.internal.VirtualClusterRegistry;
 import io.kroxylicious.proxy.internal.admin.ManagementInitializer;
 import io.kroxylicious.proxy.internal.config.Features;
 import io.kroxylicious.proxy.internal.filter.impl.ClientIdRecordingFilter;
+import io.kroxylicious.proxy.internal.filter.impl.ExchangeRecordingFilter;
 import io.kroxylicious.proxy.internal.net.DefaultNetworkBindingOperationProcessor;
 import io.kroxylicious.proxy.internal.net.EndpointRegistry;
 import io.kroxylicious.proxy.internal.net.NetworkBindingOperationProcessor;
@@ -564,7 +569,8 @@ public final class KafkaProxy implements AutoCloseable {
 
             @Override
             public Object getConfiguration() {
-                return config;
+                // Serialise with the config mapper (Jdk8Module, field visibility, plugin support); the MCP mapper can't handle Optional etc.
+                return ConfigParser.createObjectMapper().valueToTree(config);
             }
 
             @Override
@@ -609,9 +615,82 @@ public final class KafkaProxy implements AutoCloseable {
                         .distinct()
                         .sorted()
                         .toList();
+                var meters = globalRegistry.getMeters().stream()
+                        .collect(Collectors.groupingBy(m -> m.getId().getName(), TreeMap::new, Collectors.toList()))
+                        .entrySet().stream()
+                        .map(e -> {
+                            var id = e.getValue().get(0).getId();
+                            Map<String, Set<String>> labels = new TreeMap<>();
+                            e.getValue().forEach(m -> m.getId().getTags()
+                                    .forEach(t -> labels.computeIfAbsent(t.getKey(), k -> new TreeSet<>()).add(t.getValue())));
+                            Map<String, Object> details = new LinkedHashMap<>();
+                            details.put("name", e.getKey());
+                            details.put("type", id.getType().name());
+                            if (id.getDescription() != null) {
+                                details.put("description", id.getDescription());
+                            }
+                            if (id.getBaseUnit() != null) {
+                                details.put("baseUnit", id.getBaseUnit());
+                            }
+                            details.put("seriesCount", e.getValue().size());
+                            details.put("labels", labels);
+                            return details;
+                        })
+                        .toList();
                 return Map.of(
                         "meterCount", meterCount,
-                        "meterNames", meterNames);
+                        "meterNames", meterNames,
+                        "meters", meters);
+            }
+
+            @Override
+            public List<Map<String, Object>> getMetrics(Set<String> meterNames) {
+                return io.micrometer.core.instrument.Metrics.globalRegistry.getMeters().stream()
+                        .filter(m -> meterNames.contains(m.getId().getName()))
+                        .map(m -> {
+                            Map<String, String> tags = new TreeMap<>();
+                            m.getId().getTags().forEach(t -> tags.put(t.getKey(), t.getValue()));
+                            Map<String, Double> measurements = new LinkedHashMap<>();
+                            m.measure().forEach(ms -> measurements.put(ms.getStatistic().getTagValueRepresentation(), ms.getValue()));
+                            Map<String, Object> details = new LinkedHashMap<>();
+                            details.put("name", m.getId().getName());
+                            details.put("type", m.getId().getType().name());
+                            details.put("tags", tags);
+                            details.put("measurements", measurements);
+                            return details;
+                        })
+                        .sorted(Comparator.comparing((Map<String, Object> d) -> (String) d.get("name"))
+                                .thenComparing(d -> d.get("tags").toString()))
+                        .toList();
+            }
+
+            @Override
+            public List<Map<String, Object>> getClientExchanges(@Nullable String clientId) {
+                if (clientId == null) {
+                    return List.of();
+                }
+                return ExchangeRecordingFilter.instance().snapshotByClientId(clientId).stream()
+                        .map(snapshot -> {
+                            Map<String, Object> session = new LinkedHashMap<>();
+                            session.put("sessionId", snapshot.sessionId());
+                            session.put("virtualCluster", snapshot.virtualCluster());
+                            session.put("clientId", snapshot.clientId());
+                            session.put("exchanges", snapshot.exchanges().stream()
+                                    .map(ex -> {
+                                        Map<String, Object> entry = new LinkedHashMap<>();
+                                        entry.put("apiKey", ex.apiKey());
+                                        entry.put("apiVersion", (int) ex.apiVersion());
+                                        entry.put("correlationId", ex.correlationId());
+                                        entry.put("timestamp", ex.timestamp().toString());
+                                        entry.put("recordsOmitted", ex.recordsOmitted());
+                                        entry.put("request", ex.requestFields());
+                                        entry.put("response", ex.responseFields());
+                                        return entry;
+                                    })
+                                    .toList());
+                            return session;
+                        })
+                        .toList();
             }
         };
     }

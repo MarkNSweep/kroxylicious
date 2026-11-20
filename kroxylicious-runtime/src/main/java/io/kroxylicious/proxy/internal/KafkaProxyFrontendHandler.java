@@ -61,6 +61,7 @@ import io.kroxylicious.proxy.internal.filter.impl.ApiVersionsDowngradeFilter;
 import io.kroxylicious.proxy.internal.filter.impl.ApiVersionsIntersectFilter;
 import io.kroxylicious.proxy.internal.filter.impl.BrokerAddressFilter;
 import io.kroxylicious.proxy.internal.filter.impl.ClientIdRecordingFilter;
+import io.kroxylicious.proxy.internal.filter.impl.ExchangeRecordingFilter;
 import io.kroxylicious.proxy.internal.filter.impl.EagerMetadataLearner;
 import io.kroxylicious.proxy.internal.net.BrokerEndpointBinding;
 import io.kroxylicious.proxy.internal.net.EndpointReconciler;
@@ -389,6 +390,7 @@ public class KafkaProxyFrontendHandler
         var filterAndInvokers = new ArrayList<>(apiVersionFilters);
         filterAndInvokers.addAll(FilterAndInvoker.build("ApiVersionsDowngrade (internal)", apiVersionsDowngradeFilter));
         filterAndInvokers.addAll(FilterAndInvoker.build("ClientIdRecording (internal)", ClientIdRecordingFilter.instance()));
+        filterAndInvokers.addAll(FilterAndInvoker.build("ExchangeRecording (internal)", ExchangeRecordingFilter.instance()));
 
         NettyFilterContext filterContext = new NettyFilterContext(clientCtx().channel().eventLoop(), pfr);
 

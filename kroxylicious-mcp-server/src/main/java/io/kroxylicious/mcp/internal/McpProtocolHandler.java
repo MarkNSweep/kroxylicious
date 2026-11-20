@@ -5,10 +5,16 @@
  */
 package io.kroxylicious.mcp.internal;
 
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
+import java.util.Set;
+import java.util.TreeMap;
+import java.util.stream.Stream;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -133,11 +139,26 @@ public class McpProtocolHandler {
                         "prompts", Map.of("listChanged", false)),
                 "serverInfo", Map.of(
                         "name", "kroxylicious-mcp-server",
-                        "version", "0.27.0-SNAPSHOT"));
+                        "version", McpVersion.get()));
+    }
+
+    /**
+     * Returns the names of the tools this server offers.
+     *
+     * @return tool names, in the order they are listed to clients
+     */
+    public List<String> toolNames() {
+        return buildTools().stream()
+                .map(tool -> (String) tool.get("name"))
+                .toList();
     }
 
     private Object handleToolsList() {
-        var tools = List.of(
+        return Map.of("tools", buildTools());
+    }
+
+    private List<Map<String, Object>> buildTools() {
+        List<Map<String, Object>> tools = List.of(
                 Map.of(
                         "name", "get_proxy_status",
                         "description", "Get current status, lifecycle state, and uptime of the Kroxylicious proxy.",
@@ -160,9 +181,47 @@ public class McpProtocolHandler {
                         "inputSchema", Map.of("type", "object", "properties", Map.of())),
                 Map.of(
                         "name", "get_metrics_summary",
-                        "description", "Get a summary of registered Micrometer metrics in the proxy.",
-                        "inputSchema", Map.of("type", "object", "properties", Map.of())));
-        return Map.of("tools", tools);
+                        "description", "Get a summary of registered Micrometer metrics in the proxy: each meter's name, type, description, and its labels with the values currently in use. Use it to find the names and labels to pass to get_metric.",
+                        "inputSchema", Map.of("type", "object", "properties", Map.of())),
+                Map.of(
+                        "name", "get_metric",
+                        "description", "Get the current value of one metric series by its Micrometer meter name, for example "
+                                + "kroxylicious_client_to_proxy_active_connections. Returns only the measurements (for example value, or "
+                                + "count, total and max), not the labels. Use get_metrics_summary to find the meter's labels and their "
+                                + "values, then pass enough labels to select exactly one series. A meter with several series and no "
+                                + "labels given is an error.",
+                        "inputSchema", Map.of(
+                                "type", "object",
+                                "properties", Map.of(
+                                        "name", Map.of(
+                                                "type", "string",
+                                                "description", "Micrometer meter name. Use get_metrics_summary to list available names."),
+                                        "labels", Map.of(
+                                                "type", "object",
+                                                "description", "Labels that select one series, for example {\"virtual_cluster\": \"my-cluster\", \"node_id\": \"bootstrap\"}. "
+                                                        + "Each key is a label name and each value the exact value to match. Omit for a meter with a single series.",
+                                                "additionalProperties", Map.of("type", "string"))),
+                                "required", List.of("name"))),
+                Map.of(
+                        "name", "get_client_exchanges",
+                        "description", "Get the last 5 request/response exchanges for every connection made by a Kafka application, identified by its client id. "
+                                + "Returns one entry per matching connection. For record-bearing APIs (Produce, Fetch) the record payload is omitted; "
+                                + "only metadata such as API key, version, correlation id, and timestamp is returned.",
+                        "inputSchema", Map.of(
+                                "type", "object",
+                                "properties", Map.of(
+                                        "clientId", Map.of(
+                                                "type", "string",
+                                                "description", "The Kafka client id of the application to look up.")),
+                                "required", List.of("clientId"))));
+        return Stream.concat(
+                tools.stream(),
+                Arrays.stream(McpMetricCategory.values())
+                        .map(c -> Map.<String, Object> of(
+                                "name", c.toolName(),
+                                "description", c.description(),
+                                "inputSchema", Map.of("type", "object", "properties", Map.of()))))
+                .toList();
     }
 
     private Object handleToolsCall(@Nullable JsonNode params) throws Exception {
@@ -177,7 +236,9 @@ public class McpProtocolHandler {
             case "list_filter_definitions" -> inspectionContext.getFilterDefinitions();
             case "list_connected_clients" -> inspectionContext.getConnectedClients();
             case "get_metrics_summary" -> inspectionContext.getMetricsSummary();
-            default -> throw new McpInvalidParamsException("Unknown tool: " + toolName);
+            case "get_metric" -> getMetric(params);
+            case "get_client_exchanges" -> getClientExchanges(params);
+            default -> inspectionContext.getMetrics(metricCategory(toolName).meterNames());
         };
 
         String textContent = data instanceof String s ? s : objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(data);
@@ -186,6 +247,78 @@ public class McpProtocolHandler {
                         "type", "text",
                         "text", textContent)),
                 "isError", false);
+    }
+
+    private Object getMetric(JsonNode params) {
+        JsonNode arguments = params.get("arguments");
+        if (arguments == null || !arguments.hasNonNull("name") || !arguments.get("name").isTextual() || arguments.get("name").asText().isBlank()) {
+            throw new McpInvalidParamsException("'name' argument is required for get_metric and must be a non-empty string");
+        }
+        String meterName = arguments.get("name").asText();
+        Map<String, String> labels = labelFilter(arguments.get("labels"));
+        List<Map<String, Object>> matches = inspectionContext.getMetrics(Set.of(meterName)).stream()
+                .filter(meter -> hasLabels(meter, labels))
+                .toList();
+        if (matches.isEmpty()) {
+            throw new McpInvalidParamsException("no series of metric '" + meterName + "' matches labels " + new TreeMap<>(labels)
+                    + "; use get_metrics_summary to find valid names, labels and label values");
+        }
+        if (matches.size() > 1) {
+            throw new McpInvalidParamsException(matches.size() + " series of metric '" + meterName + "' match labels " + new TreeMap<>(labels)
+                    + "; supply more labels to select one. Labels that still differ between the matching series: " + differingLabels(matches));
+        }
+        return matches.get(0).get("measurements");
+    }
+
+    private Object getClientExchanges(@Nullable JsonNode params) {
+        JsonNode arguments = params != null ? params.get("arguments") : null;
+        if (arguments == null || !arguments.hasNonNull("clientId") || !arguments.get("clientId").isTextual() || arguments.get("clientId").asText().isBlank()) {
+            throw new McpInvalidParamsException("'clientId' argument is required for get_client_exchanges and must be a non-empty string");
+        }
+        String clientId = arguments.get("clientId").asText();
+        return inspectionContext.getClientExchanges(clientId);
+    }
+
+    private static List<String> differingLabels(List<Map<String, Object>> meters) {
+        Map<String, Set<Object>> valuesByLabel = new TreeMap<>();
+        for (Map<String, Object> meter : meters) {
+            if (meter.get("tags") instanceof Map<?, ?> tags) {
+                tags.forEach((k, v) -> valuesByLabel.computeIfAbsent(String.valueOf(k), key -> new HashSet<>()).add(v));
+            }
+        }
+        return valuesByLabel.entrySet().stream()
+                .filter(e -> e.getValue().size() > 1)
+                .map(Map.Entry::getKey)
+                .toList();
+    }
+
+    private static Map<String, String> labelFilter(@Nullable JsonNode labelsNode) {
+        if (labelsNode == null || labelsNode.isNull()) {
+            return Map.of();
+        }
+        if (!labelsNode.isObject()) {
+            throw new McpInvalidParamsException("'labels' argument must be an object of label names to values");
+        }
+        Map<String, String> labels = new HashMap<>();
+        labelsNode.fields().forEachRemaining(e -> {
+            if (!e.getValue().isValueNode() || e.getValue().isNull()) {
+                throw new McpInvalidParamsException("label '" + e.getKey() + "' must have a string value");
+            }
+            labels.put(e.getKey(), e.getValue().asText());
+        });
+        return labels;
+    }
+
+    private static boolean hasLabels(Map<String, Object> meter, Map<String, String> labels) {
+        return meter.get("tags") instanceof Map<?, ?> tags
+                && labels.entrySet().stream().allMatch(e -> e.getValue().equals(tags.get(e.getKey())));
+    }
+
+    private static McpMetricCategory metricCategory(String toolName) {
+        return Arrays.stream(McpMetricCategory.values())
+                .filter(c -> c.toolName().equals(toolName))
+                .findFirst()
+                .orElseThrow(() -> new McpInvalidParamsException("Unknown tool: " + toolName));
     }
 
     private Object handleResourcesList() {

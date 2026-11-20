@@ -7,6 +7,7 @@ package io.kroxylicious.mcp.internal;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -98,7 +99,217 @@ class McpProtocolHandlerTest {
         assertThat(tools.isArray()).isTrue();
         assertThat(tools).extracting(t -> t.get("name").asText())
                 .containsExactlyInAnyOrder("get_proxy_status", "get_proxy_config", "list_virtual_clusters", "list_filter_definitions", "list_connected_clients",
-                        "get_metrics_summary");
+                        "get_metrics_summary", "get_metric", "get_client_exchanges",
+                        "get_connection_metrics", "get_message_metrics", "get_reconfiguration_metrics", "get_virtual_cluster_lifecycle_metrics",
+                        "get_authentication_metrics");
+    }
+
+    @Test
+    void handleToolsCallConnectionMetrics() throws Exception {
+        when(inspectionContext.getMetrics(McpMetricCategory.CONNECTION.meterNames())).thenReturn(List.of(
+                Map.of("name", "kroxylicious_client_to_proxy_active_connections",
+                        "type", "GAUGE",
+                        "tags", Map.of("virtual_cluster", "my-cluster", "node_id", "bootstrap"),
+                        "measurements", Map.of("value", 3.0))));
+
+        String request = """
+                {
+                  "jsonrpc": "2.0",
+                  "id": 12,
+                  "method": "tools/call",
+                  "params": {
+                    "name": "get_connection_metrics",
+                    "arguments": {}
+                  }
+                }
+                """;
+
+        var responseOpt = protocolHandler.handleMessage(request);
+        assertThat(responseOpt).isPresent();
+
+        JsonNode responseNode = objectMapper.readTree(responseOpt.get());
+        assertThat(responseNode.get("result").get("isError").asBoolean()).isFalse();
+        assertThat(responseNode.get("result").get("content").get(0).get("text").asText())
+                .contains("kroxylicious_client_to_proxy_active_connections", "my-cluster");
+    }
+
+    @Test
+    void handleToolsCallGetMetricReturnsOnlyValueOfSelectedSeries() throws Exception {
+        when(inspectionContext.getMetrics(Set.of("kroxylicious_client_to_proxy_active_connections"))).thenReturn(List.of(
+                Map.of("name", "kroxylicious_client_to_proxy_active_connections",
+                        "type", "GAUGE",
+                        "tags", Map.of("virtual_cluster", "cluster-a", "node_id", "bootstrap"),
+                        "measurements", Map.of("value", 3.0)),
+                Map.of("name", "kroxylicious_client_to_proxy_active_connections",
+                        "type", "GAUGE",
+                        "tags", Map.of("virtual_cluster", "cluster-b", "node_id", "bootstrap"),
+                        "measurements", Map.of("value", 7.0))));
+
+        String request = """
+                {
+                  "jsonrpc": "2.0",
+                  "id": 14,
+                  "method": "tools/call",
+                  "params": {
+                    "name": "get_metric",
+                    "arguments": {
+                      "name": "kroxylicious_client_to_proxy_active_connections",
+                      "labels": {"virtual_cluster": "cluster-b"}
+                    }
+                  }
+                }
+                """;
+
+        var responseOpt = protocolHandler.handleMessage(request);
+        assertThat(responseOpt).isPresent();
+
+        JsonNode responseNode = objectMapper.readTree(responseOpt.get());
+        JsonNode value = objectMapper.readTree(responseNode.get("result").get("content").get(0).get("text").asText());
+        assertThat(value.get("value").asDouble()).isEqualTo(7.0);
+        assertThat(value.has("tags")).isFalse();
+        assertThat(value.has("name")).isFalse();
+    }
+
+    @Test
+    void handleToolsCallGetMetricWithoutLabelsOnSingleSeries() throws Exception {
+        when(inspectionContext.getMetrics(Set.of("kroxylicious_reconfigure_duration_seconds"))).thenReturn(List.of(
+                Map.of("name", "kroxylicious_reconfigure_duration_seconds", "type", "TIMER", "tags", Map.of(),
+                        "measurements", Map.of("count", 2.0, "total", 1.5, "max", 1.0))));
+
+        String request = """
+                {
+                  "jsonrpc": "2.0",
+                  "id": 15,
+                  "method": "tools/call",
+                  "params": {
+                    "name": "get_metric",
+                    "arguments": {"name": "kroxylicious_reconfigure_duration_seconds"}
+                  }
+                }
+                """;
+
+        var responseOpt = protocolHandler.handleMessage(request);
+        assertThat(responseOpt).isPresent();
+
+        JsonNode responseNode = objectMapper.readTree(responseOpt.get());
+        JsonNode value = objectMapper.readTree(responseNode.get("result").get("content").get(0).get("text").asText());
+        assertThat(value.get("count").asDouble()).isEqualTo(2.0);
+        assertThat(value.get("total").asDouble()).isEqualTo(1.5);
+        assertThat(value.get("max").asDouble()).isEqualTo(1.0);
+    }
+
+    @Test
+    void handleToolsCallGetMetricAmbiguousSeriesIsError() throws Exception {
+        when(inspectionContext.getMetrics(Set.of("kroxylicious_client_auth_total"))).thenReturn(List.of(
+                Map.of("name", "kroxylicious_client_auth_total", "type", "COUNTER", "tags", Map.of("outcome", "success"), "measurements", Map.of("count", 1.0)),
+                Map.of("name", "kroxylicious_client_auth_total", "type", "COUNTER", "tags", Map.of("outcome", "failure"), "measurements", Map.of("count", 2.0))));
+
+        String request = """
+                {
+                  "jsonrpc": "2.0",
+                  "id": 18,
+                  "method": "tools/call",
+                  "params": {
+                    "name": "get_metric",
+                    "arguments": {"name": "kroxylicious_client_auth_total"}
+                  }
+                }
+                """;
+
+        var responseOpt = protocolHandler.handleMessage(request);
+        assertThat(responseOpt).isPresent();
+
+        JsonNode responseNode = objectMapper.readTree(responseOpt.get());
+        assertThat(responseNode.get("error").get("code").asInt()).isEqualTo(-32602);
+        assertThat(responseNode.get("error").get("message").asText()).contains("2 series", "outcome");
+    }
+
+    @Test
+    void handleToolsCallGetMetricNoMatchingSeriesIsError() throws Exception {
+        when(inspectionContext.getMetrics(Set.of("kroxylicious_client_auth_total"))).thenReturn(List.of(
+                Map.of("name", "kroxylicious_client_auth_total", "type", "COUNTER", "tags", Map.of("outcome", "success"), "measurements", Map.of("count", 1.0))));
+
+        String request = """
+                {
+                  "jsonrpc": "2.0",
+                  "id": 19,
+                  "method": "tools/call",
+                  "params": {
+                    "name": "get_metric",
+                    "arguments": {"name": "kroxylicious_client_auth_total", "labels": {"outcome": "nope"}}
+                  }
+                }
+                """;
+
+        var responseOpt = protocolHandler.handleMessage(request);
+        assertThat(responseOpt).isPresent();
+
+        JsonNode responseNode = objectMapper.readTree(responseOpt.get());
+        assertThat(responseNode.get("error").get("code").asInt()).isEqualTo(-32602);
+        assertThat(responseNode.get("error").get("message").asText()).contains("get_metrics_summary");
+    }
+
+    @Test
+    void handleToolsCallGetMetricRequiresName() throws Exception {
+        String request = """
+                {
+                  "jsonrpc": "2.0",
+                  "id": 16,
+                  "method": "tools/call",
+                  "params": {
+                    "name": "get_metric",
+                    "arguments": {}
+                  }
+                }
+                """;
+
+        var responseOpt = protocolHandler.handleMessage(request);
+        assertThat(responseOpt).isPresent();
+
+        JsonNode responseNode = objectMapper.readTree(responseOpt.get());
+        assertThat(responseNode.get("error").get("code").asInt()).isEqualTo(-32602);
+    }
+
+    @Test
+    void handleToolsCallGetMetricRejectsNonObjectLabels() throws Exception {
+        String request = """
+                {
+                  "jsonrpc": "2.0",
+                  "id": 17,
+                  "method": "tools/call",
+                  "params": {
+                    "name": "get_metric",
+                    "arguments": {"name": "kroxylicious_client_auth_total", "labels": "virtual_cluster=a"}
+                  }
+                }
+                """;
+
+        var responseOpt = protocolHandler.handleMessage(request);
+        assertThat(responseOpt).isPresent();
+
+        JsonNode responseNode = objectMapper.readTree(responseOpt.get());
+        assertThat(responseNode.get("error").get("code").asInt()).isEqualTo(-32602);
+    }
+
+    @Test
+    void handleToolsCallUnknownTool() throws Exception {
+        String request = """
+                {
+                  "jsonrpc": "2.0",
+                  "id": 13,
+                  "method": "tools/call",
+                  "params": {
+                    "name": "no_such_tool",
+                    "arguments": {}
+                  }
+                }
+                """;
+
+        var responseOpt = protocolHandler.handleMessage(request);
+        assertThat(responseOpt).isPresent();
+
+        JsonNode responseNode = objectMapper.readTree(responseOpt.get());
+        assertThat(responseNode.get("error").get("code").asInt()).isEqualTo(-32602);
     }
 
     @Test
@@ -265,6 +476,62 @@ class McpProtocolHandlerTest {
         JsonNode responseNode = objectMapper.readTree(responseOpt.get());
         assertThat(responseNode.has("error")).isTrue();
         assertThat(responseNode.get("error").get("code").asInt()).isEqualTo(-32601);
+    }
+
+    @Test
+    void handleToolsCallGetClientExchanges() throws Exception {
+        when(inspectionContext.getClientExchanges("my-app")).thenReturn(List.of(
+                Map.of("sessionId", "sess-1",
+                        "virtualCluster", "my-cluster",
+                        "clientId", "my-app",
+                        "exchanges", List.of(
+                                Map.of("apiKey", "METADATA", "apiVersion", 12, "correlationId", 1,
+                                        "timestamp", "2026-01-01T00:00:00Z", "recordsOmitted", false,
+                                        "request", Map.of("apiKey", "METADATA"),
+                                        "response", Map.of("apiKey", "METADATA"))))));
+
+        String request = """
+                {
+                  "jsonrpc": "2.0",
+                  "id": 20,
+                  "method": "tools/call",
+                  "params": {
+                    "name": "get_client_exchanges",
+                    "arguments": {
+                      "clientId": "my-app"
+                    }
+                  }
+                }
+                """;
+
+        var responseOpt = protocolHandler.handleMessage(request);
+        assertThat(responseOpt).isPresent();
+
+        JsonNode responseNode = objectMapper.readTree(responseOpt.get());
+        assertThat(responseNode.get("result").get("isError").asBoolean()).isFalse();
+        assertThat(responseNode.get("result").get("content").get(0).get("text").asText())
+                .contains("my-app", "sess-1", "METADATA");
+    }
+
+    @Test
+    void handleToolsCallGetClientExchangesRequiresClientId() throws Exception {
+        String request = """
+                {
+                  "jsonrpc": "2.0",
+                  "id": 21,
+                  "method": "tools/call",
+                  "params": {
+                    "name": "get_client_exchanges",
+                    "arguments": {}
+                  }
+                }
+                """;
+
+        var responseOpt = protocolHandler.handleMessage(request);
+        assertThat(responseOpt).isPresent();
+
+        JsonNode responseNode = objectMapper.readTree(responseOpt.get());
+        assertThat(responseNode.get("error").get("code").asInt()).isEqualTo(-32602);
     }
 
     @Test

@@ -26,6 +26,7 @@ import io.kroxylicious.mcp.config.McpConfiguration;
 import io.kroxylicious.mcp.internal.McpChannelInitializer;
 import io.kroxylicious.mcp.internal.McpProtocolHandler;
 import io.kroxylicious.mcp.internal.McpSessionManager;
+import io.kroxylicious.mcp.internal.McpVersion;
 
 import edu.umd.cs.findbugs.annotations.Nullable;
 
@@ -108,6 +109,15 @@ public class McpServer implements AutoCloseable {
 
         String bindAddress = configuration.getEffectiveBindAddress();
         int port = configuration.getEffectivePort();
+
+        LOGGER.atInfo()
+                .addKeyValue("version", McpVersion.get())
+                .log("Starting MCP server");
+        var toolNames = protocolHandler.toolNames();
+        LOGGER.atInfo()
+                .addKeyValue("toolCount", toolNames.size())
+                .addKeyValue("tools", toolNames)
+                .log("MCP server offers tools");
 
         LOGGER.atInfo()
                 .addKeyValue("bindAddress", bindAddress)
